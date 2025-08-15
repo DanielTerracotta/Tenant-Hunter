@@ -1,6 +1,4 @@
 # -*- coding: utf-8 -*-
-
-# -*- coding: utf-8 -*-
 """Tenant Hunter - Refined Google Sheets Script with Silent API Error Handling
 
 This script automates the process of finding and evaluating business leads from a Google Sheet.
@@ -12,6 +10,8 @@ It now includes:
 - An enhanced AI evaluation prompt that includes review data.
 - All website-grabbing functionality has been removed.
 - Updates the status of a completed property in the control sheet.
+- **IMPORTANT**: Credentials and API keys are now read from environment variables,
+  not local files, for secure GitHub Actions execution.
 """
 
 # --- LIBRARY IMPORTS ---
@@ -25,9 +25,7 @@ import math
 from google.oauth2.service_account import Credentials
 
 # --- CONFIGURATION (Edit These Only) ---
-# You must create a Google Service Account and share the sheet with its email.
-# The `service_account.json` file must be in the same folder as this script.
-SERVICE_ACCOUNT_FILE = 'service_account.json'
+# The spreadsheet ID is now part of the script itself, not a credential.
 SPREADSHEET_ID = "1VcliY4xbM7yNHMRpOtj5b1YQJ6gueudpetdcZfDx7sM"
 CONTROL_SHEET_NAME = "Control_Sheet"
 
@@ -36,26 +34,40 @@ BATCH_SIZE = 20
 FILTER_HIGH_ONLY = True
 
 # New Review Fetching Filters
-# If a business meets these criteria, we will skip fetching reviews to save time and API calls.
-REVIEW_FILTER_MIN_RATING = 4.0   # A rating of 4.0 or higher is considered good.
-REVIEW_FILTER_MIN_COUNT = 50     # A count of 50 or more reviews is considered a large sample size.
+REVIEW_FILTER_MIN_RATING = 4.0
+REVIEW_FILTER_MIN_COUNT = 50
 
 # --- API KEYS ---
-# IMPORTANT: Replace with your actual keys
-API_KEY = "AIzaSyDl2BXqYX8IqTQ1PPSeVDrnLkYk336GQoY"
-YELP_API_KEY = "nkhCKQaJWSxDXqNEum1frfaIERdSOSPBTBEWpmJe6ctND1uv-S9OqG5B8ieZv2XdMYzs4VFupk2lI2FtjEpRoJzkmyHw67S4WyEclr-KJNj1N0e-zMOOA-4oSRyNaHYx"
-YELP_HEADERS = {"Authorization": f"Bearer {YELP_API_KEY}"}
+# IMPORTANT: These are now read from environment variables
+# as defined in your GitHub Actions workflow.
+try:
+    API_KEY = os.environ['GEMINI_API_KEY']
+    YELP_API_KEY = os.environ['YELP_API_KEY']
+    YELP_HEADERS = {"Authorization": f"Bearer {YELP_API_KEY}"}
+except KeyError as e:
+    print(f"❌ Missing required environment variable: {e}")
+    exit()
 
 # --- HELPER FUNCTIONS ---
 
 def get_sheet_connection():
-    """Establishes and returns a connection to the Google Sheet."""
+    """Establishes and returns a connection to the Google Sheet using credentials from an environment variable."""
     try:
+        # Get credentials JSON string from the environment variable
+        creds_json_str = os.environ['GOOGLE_SHEET_CREDS']
+        creds_info = json.loads(creds_json_str)
+
         scope = ['https://www.googleapis.com/auth/spreadsheets']
-        creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scope)
+        creds = Credentials.from_service_account_info(creds_info, scopes=scope)
         gc = gspread.authorize(creds)
         sh = gc.open_by_key(SPREADSHEET_ID)
         return sh
+    except KeyError:
+        print("❌ GOOGLE_SHEET_CREDS environment variable not found.")
+        return None
+    except json.JSONDecodeError:
+        print("❌ Failed to parse JSON from GOOGLE_SHEET_CREDS environment variable.")
+        return None
     except Exception as e:
         print(f"❌ Error connecting to Google Sheets: {e}")
         return None
@@ -130,7 +142,7 @@ def yelp_search_leads(term, city, limit=50, radius=40000):
     """
     yelp_url = "https://api.yelp.com/v3/businesses/search"
     all_leads = []
-
+    
     for offset in range(0, limit, 50):
         params = {
             'term': term,
@@ -144,14 +156,13 @@ def yelp_search_leads(term, city, limit=50, radius=40000):
             response = requests.get(yelp_url, headers=YELP_HEADERS, params=params)
             response.raise_for_status()
             businesses = response.json().get('businesses', [])
-
+            
             for business in businesses:
                 rating = business.get('rating', 0)
                 review_count = business.get('review_count', 0)
 
                 # NEW: Initial filter to skip low-quality leads
                 if rating < 3.0 and review_count <= 3:
-                    print(f"Skipping '{business.get('name')}' due to low rating ({rating}) and few reviews ({review_count}).")
                     continue
 
                 lead = {
@@ -166,14 +177,14 @@ def yelp_search_leads(term, city, limit=50, radius=40000):
                     'reviews': []
                 }
                 all_leads.append(lead)
-
+            
         except requests.exceptions.RequestException as e:
             print(f"❌ Yelp API request failed for '{term}': {e}")
             break
-
+        
         # Add a small delay to avoid rate-limiting on the search API
         time.sleep(1)
-
+            
     return all_leads
 
 def get_yelp_reviews(business_id):
@@ -190,17 +201,15 @@ def get_yelp_reviews(business_id):
         for review in reviews_json:
             reviews.append(review.get('text', ''))
     except requests.exceptions.HTTPError as e:
-        # Gracefully handle 404 (Not Found) errors silently
         if e.response.status_code == 404:
-            pass  # Do not print an error message, just continue
+            pass
         elif e.response.status_code == 429:
             print(f"❌ Failed to fetch reviews for business ID {business_id}: 429 Client Error: Too Many Requests.")
         else:
             print(f"❌ Failed to fetch reviews for business ID {business_id}: {e}")
     except requests.exceptions.RequestException as e:
         print(f"❌ Failed to fetch reviews for business ID {business_id}: {e}")
-
-    # Add a small delay to avoid rate-limiting on the review API
+    
     time.sleep(0.5)
     return reviews
 
@@ -211,7 +220,7 @@ def ai_evaluate_batch(batch, suite_sizes, property_city):
     Returns a list of leads with evaluation results.
     """
     results = []
-
+    
     prompt_parts = [
         "You are an expert commercial real estate analyst. "
         "Your task is to evaluate a list of businesses to determine their likelihood of being a viable tenant "
@@ -227,7 +236,7 @@ def ai_evaluate_batch(batch, suite_sizes, property_city):
             prompt_parts.append("  Recent Reviews:\n")
             for review in lead['reviews']:
                 prompt_parts.append(f"  - \"{review}\"\n")
-
+    
     prompt = "".join(prompt_parts)
 
     try:
@@ -251,7 +260,7 @@ def ai_evaluate_batch(batch, suite_sizes, property_city):
                 }
             }
         }
-
+        
         retry_count = 0
         max_retries = 5
         while retry_count < max_retries:
@@ -260,7 +269,7 @@ def ai_evaluate_batch(batch, suite_sizes, property_city):
                 response = requests.post(apiUrl, headers={'Content-Type': 'application/json'}, data=json.dumps(payload))
                 response.raise_for_status()
                 result = response.json()
-
+                
                 if result.get("candidates") and result["candidates"][0].get("content") and result["candidates"][0]["content"].get("parts"):
                     raw_json = result["candidates"][0]["content"]["parts"][0]["text"]
                     evals = json.loads(raw_json)
@@ -289,11 +298,10 @@ def ai_evaluate_batch(batch, suite_sizes, property_city):
     for idx, eval_row in enumerate(evals):
         if idx >= len(batch):
             break
-
+        
         if FILTER_HIGH_ONLY and eval_row.get("Likelihood", "Low") != "High":
             continue
-
-        # The 'Reviews' field is no longer included in the output row
+            
         lead_output_row = [
             batch[idx].get("name"),
             batch[idx].get("address"),
@@ -317,66 +325,62 @@ def run_scan():
     searching for leads, fetching reviews, and writing the results to new sheets.
     """
     print("🚀 Starting Tenant Hunter program...")
-
+    
     control_data = read_from_sheet(CONTROL_SHEET_NAME)
     if not control_data:
         print("🛑 Failed to retrieve data from Control Sheet. Exiting.")
         return
-
+    
     control_header = control_data[0]
     control_rows = control_data[1:]
 
     for control_row in control_rows:
         control_dict = dict(zip(control_header, control_row))
-
+        
         if (control_dict.get("Status (paused/active)", "").strip().lower() != "active"):
             print(f"Skipping '{control_dict.get('Property Name', 'N/A')}' - not active.")
             continue
-
+            
         print(f"--- Processing Property: {control_dict['Property Name']} ---")
-
+        
         property_city = control_dict["City"]
         search_terms = [term.strip() for term in control_dict["Search Terms"].split(',')]
         sheet_prefix = control_dict["Sheet Prefix"]
         suite_sizes = control_dict["Suite Sizes"]
-
+        
         all_new_leads = []
         for term in search_terms:
             print(f"Searching Yelp for new leads with term: '{term}'...")
             leads = yelp_search_leads(term, property_city, limit=50)
             all_new_leads.extend(leads)
-
+        
         if not all_new_leads:
             print(f"No new leads found for '{control_dict['Property Name']}'.")
             continue
-
+            
         output_sheet_name = f"{sheet_prefix}_RankedLeads"
-
-        print("Fetching reviews for businesses that need closer evaluation...")
+        
         for lead in all_new_leads:
             rating = lead.get('rating', 0)
             review_count = lead.get('review_count', 0)
-
-            # Skip review fetching for high-rated businesses with a lot of reviews,
-            # or businesses with no reviews
+            
             if (rating >= REVIEW_FILTER_MIN_RATING and review_count >= REVIEW_FILTER_MIN_COUNT) or review_count == 0:
                 if review_count == 0:
-                    pass # Silently skip fetching reviews for businesses with no reviews
+                    pass
                 else:
-                    print(f"Skipping review fetch for '{lead['name']}' due to high rating/review count filter.")
+                    pass
                 continue
-
+            
             business_id = lead.get('business_id')
             if business_id:
                 reviews = get_yelp_reviews(business_id)
                 lead['reviews'] = reviews
-
-        # The 'Reviews' column has been removed from the header
+                
         output_header = ["Business Name", "Address", "Phone", "Rating", "Review Count", "Business Type", "Source"]
         output_header += ["Likelihood", "Run Timestamp", "Reasoning"]
-
+        
         all_evaluated_leads = []
-
+        
         num_batches = math.ceil(len(all_new_leads) / BATCH_SIZE)
         if num_batches > 0:
           for i in range(0, len(all_new_leads), BATCH_SIZE):
@@ -387,10 +391,9 @@ def run_scan():
               all_evaluated_leads.extend(evaluated_batch)
         else:
           print(f"No leads to process for '{control_dict['Property Name']}'.")
-
+            
         write_to_sheet(output_sheet_name, output_header, all_evaluated_leads)
-
-        # New function call to update the control sheet
+        
         update_control_sheet_status(sheet_prefix)
 
     print("🎉 Program finished successfully.")
